@@ -1,10 +1,10 @@
 'use strict';
 
-var spawn = require('child_process').spawn,
-    es    = require('event-stream');
+const spawn = require('child_process').spawn;
+const es = require('event-stream');
 
 module.exports = function childrenOfPid(pid, callback) {
-  var headers = null;
+  let headers = null;
 
   if (typeof callback !== 'function') {
     throw new Error('childrenOfPid(pid, callback) expects callback');
@@ -35,64 +35,106 @@ module.exports = function childrenOfPid(pid, callback) {
   // /usr/libexec/Use     1    43 Ss
   //
   // Win32:
-  // 1. wmic PROCESS WHERE ParentProcessId=4604 GET Name,ParentProcessId,ProcessId,Status)
-  // 2. The order of head columns is fixed
+  // 1. powershell Get-WmiObject -Class Win32_Process | Select-Object -Property Name,ProcessId,ParentProcessId,Status | Format-Table
+  // 2. Outputs CSV with columns ParentProcessId,ProcessId,Status,Name (matching PPID,PID,STAT,COMMAND after normalization).
+  // 3. Name column may contain spaces or commas; CSV parsing handles these reliably.
+  // 4. Status column is usually empty. Output includes a header row, no dashes or empty lines.
   // ```shell
-  // > wmic PROCESS GET Name,ProcessId,ParentProcessId,Status
-  // Name                          ParentProcessId  ProcessId   Status
-  // System Idle Process           0                0
-  // System                        0                4
-  // smss.exe                      4                228
+  // > powershell Get-CimInstance -Class Win32_Process | Select-Object -Property ParentProcessId,ProcessId,Status,Name | ConvertTo-Csv -NoTypeInformation
+  // "ParentProcessId","ProcessId","Status","Name"
+  // "0","0","","System Idle Process"
+  // "567","1234","","svchost.exe"
+  // "1234","5678","","C:\Program Files\App\app.exe"
   // ```
 
-  var processLister;
-  if (process.platform === 'win32') {
-    // See also: https://github.com/nodejs/node-v0.x-archive/issues/2318
-    processLister = spawn('wmic.exe', ['PROCESS', 'GET', 'Name,ProcessId,ParentProcessId,Status']);
+  const isWindows = process.platform === 'win32';
+  let processLister;
+
+  if (isWindows) {
+    // WMIC is deprecated since 2016; using powershell 5.1
+    processLister = spawn('powershell.exe', [
+      'Get-CimInstance -Class Win32_Process | Select-Object -Property ParentProcessId,ProcessId,Status,Name | ConvertTo-Csv -NoTypeInformation',
+    ]);
   } else {
     processLister = spawn('ps', ['-A', '-o', 'ppid,pid,stat,comm']);
   }
 
   es.connect(
-    // spawn('ps', ['-A', '-o', 'ppid,pid,stat,comm']).stdout,
     processLister.stdout,
     es.split(),
-    es.map(function (line, cb) { //this could parse alot of unix command output
-      var columns = line.trim().split(/\s+/);
-      if (!headers) {
-        headers = columns;
+    es.map(function (line, cb) {
+      const trimmedLine = line.trim();
 
-        //
-        // Rename Win32 header name, to as same as the linux, for compatible.
-        //
-        headers = headers.map(normalizeHeader);
+      // Skip empty lines or header separator (for Linux/Darwin)
+      if (trimmedLine.length === 0 || trimmedLine.includes('----')) {
         return cb();
       }
 
-      var row = {};
-      // For each header
-      var h = headers.slice();
-      while (h.length) {
-        row[h.shift()] = h.length ? columns.shift() : columns.join(' ');
+      if (headers === null) {
+        // Extract headers (CSV for Windows, space-split for Linux/Darwin)
+        const rawHeaders = isWindows ? parseCsvLine(trimmedLine) : trimmedLine.split(/\s+/);
+        headers = rawHeaders.map(normalizeHeader);
+        return cb();
       }
+
+      // Extract columns (CSV for Windows, regex for Linux/Darwin)
+      let columns;
+      if (isWindows) {
+        columns = parseCsvLine(trimmedLine);
+      } else {
+        const match = trimmedLine.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+        columns = match ? match.slice(1) : [];
+      }
+
+      if (columns.length < headers.length) {
+        return cb(); // Skip malformed lines
+      }
+
+      const row = {};
+      headers.forEach((header, i) => {
+        row[header] = columns[i] || '';
+      });
 
       return cb(null, row);
     }),
     es.writeArray(function (err, ps) {
       var parents = {},
-          children = [];
+        children = [];
 
       parents[pid] = true;
       ps.forEach(function (proc) {
         if (parents[proc.PPID]) {
           parents[proc.PID] = true;
-          children.push(proc)
+          children.push(proc);
         }
       });
 
       callback(null, children);
     })
-  ).on('error', callback)
+  ).on('error', callback);
+};
+
+/**
+ * Simple CSV line parser to handle quoted fields.
+ * @param {string} line - The CSV line to parse.
+ * @returns {string[]} Array of fields.
+ */
+function parseCsvLine(line) {
+  const fields = [];
+  let current = '';
+  let inQuote = false;
+  for (let c of line) {
+    if (c === '"') {
+      inQuote = !inQuote;
+    } else if (c === ',' && !inQuote) {
+      fields.push(current);
+      current = '';
+    } else {
+      current += c;
+    }
+  }
+  fields.push(current);
+  return fields;
 }
 
 /**
@@ -103,20 +145,16 @@ module.exports = function childrenOfPid(pid, callback) {
  */
 function normalizeHeader(str) {
   switch (str) {
-    case 'Name':  // for win32
-    case 'COMM':  // for darwin
+    case 'Name': // for win32
+    case 'COMM': // for darwin
       return 'COMMAND';
-      break;
     case 'ParentProcessId':
       return 'PPID';
-      break;
     case 'ProcessId':
       return 'PID';
-      break;
     case 'Status':
       return 'STAT';
-      break;
     default:
-      return str
+      return str;
   }
 }
